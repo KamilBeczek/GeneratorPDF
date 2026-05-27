@@ -2,70 +2,136 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using PdfSharp.Fonts;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using PdfSharp.Pdf;
 using PdfSharp.Pdf.IO;
 using PdfSharp.Pdf.AcroForms;
 using GenerateDocumentLibrary.Models;
+using GenerateDocumentLibrary.Services.Fillers;
 
 namespace GenerateDocumentLibrary.Services
 {
-    public class DocumentGeneratorService
+    /// <summary>
+    /// Główny serwis odpowiedzialny za sekwencyjne generowanie wszystkich dokumentów PDF.
+    /// </summary>
+    public class DocumentGeneratorService : IDocumentGeneratorService
     {
-        private readonly ILogger _logger;
+        private readonly ILogger<DocumentGeneratorService> _logger;
+        private readonly IEnumerable<IDocumentFiller> _fillers;
+        private readonly IEmployeeDataProvider _employeeDataProvider;
 
-        public DocumentGeneratorService(ILogger logger)
+        /// <summary>
+        /// Konstruktor serwisu wykorzystujący wstrzykiwanie zależności (Dependency Injection).
+        /// </summary>
+        public DocumentGeneratorService(
+            ILogger<DocumentGeneratorService> logger, 
+            IEnumerable<IDocumentFiller> fillers,
+            IEmployeeDataProvider employeeDataProvider)
         {
             _logger = logger;
+            _fillers = fillers;
+            _employeeDataProvider = employeeDataProvider;
         }
 
         /// <summary>
-        /// Generuje tablicę bajtów PDF na podstawie identyfikatora pracownika. Szablon 'template.pdf' jest ładowany automatycznie.
+        /// Konstruktor zapewniający kompatybilność wsteczną dla wywołań bez DI.
         /// </summary>
-        public async Task<byte[]> GenerateContractPdfBytesAsync(string employeeId)
+        public DocumentGeneratorService(ILogger logger)
         {
-            _logger.LogInformation("Rozpoczęto generowanie PDF w bibliotece dla EmployeeId: {EmployeeId}", employeeId);
+            _logger = new LoggerFactory().CreateLogger<DocumentGeneratorService>();
+            _employeeDataProvider = new MockEmployeeDataProvider();
+            _fillers = new List<IDocumentFiller>
+            {
+                new EdCardFiller(),
+                new GraComplianceFormFiller(),
+                new NisRegistrationFormFiller(),
+                new NisComplianceFormFiller(),
+                new TinFormFiller(),
+                new VisaFormFiller()
+            };
+        }
 
-            // 1. Automatyczne ustalenie ścieżki do szablonu PDF
-            string templatePath = Path.Combine(AppContext.BaseDirectory, "template.pdf");
+        /// <summary>
+        /// Pobiera dane pracownika i uzupełnia sekwencyjnie po kolei wszystkie dokumenty (fillery).
+        /// </summary>
+        public async Task GenerateAllComplianceLettersAsync(string employeeId)
+        {
+            _logger.LogInformation("Rozpoczęto sekwencyjne generowanie wszystkich dokumentów dla EmployeeId: {EmployeeId}", employeeId);
+
+            // 1. Pobranie zjednoczonych danych pracownika
+            UnifiedEmployeeData employeeData = await _employeeDataProvider.GetEmployeeDataAsync(employeeId);
+            _logger.LogInformation("Pobrano dane pracownika do wypełnienia dokumentów: {FullName}", employeeData.FullName);
+
+            // 2. Sekwencyjne uruchamianie każdego fillera po kolei
+            foreach (var filler in _fillers)
+            {
+                _logger.LogInformation("Wymuszanie uzupełnienia dokumentu typu: {DocType} za pomocą szablonu: {Template}", filler.SupportedType, filler.TemplateFileName);
+
+                try
+                {
+                    // Generowanie bajtów pliku PDF dla konkretnego dokumentu
+                    byte[] pdfBytes = await GenerateSinglePdfBytesAsync(employeeData, filler);
+
+                    // Zapis wygenerowanego dokumentu do bazy danych / magazynu
+                    await SaveFileToDatabaseAsync(employeeId, filler.SupportedType, pdfBytes);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Wystąpił błąd podczas generowania dokumentu {DocType}", filler.SupportedType);
+                    throw;
+                }
+            }
+
+            _logger.LogInformation("Pomyślnie ukończono sekwencyjne generowanie wszystkich {Count} dokumentów dla EmployeeId: {EmployeeId}", _fillers.Count(), employeeId);
+        }
+
+        /// <summary>
+        /// Pomocnicza metoda generująca bajty pojedynczego pliku PDF.
+        /// </summary>
+        private async Task<byte[]> GenerateSinglePdfBytesAsync(UnifiedEmployeeData employeeData, IDocumentFiller filler)
+        {
+            string templateName = filler.TemplateFileName;
+            string templatePath = Path.Combine(AppContext.BaseDirectory, templateName);
+
+            // Sprawdzenie obecności dedykowanego szablonu, w przypadku braku - automatyczny fallback do template.pdf
             if (!File.Exists(templatePath))
             {
-                string alternativePath = Path.Combine(Directory.GetCurrentDirectory(), "template.pdf");
+                string alternativePath = Path.Combine(Directory.GetCurrentDirectory(), templateName);
                 if (File.Exists(alternativePath))
                 {
                     templatePath = alternativePath;
                 }
                 else
                 {
-                    throw new FileNotFoundException($"Brak szablonu 'template.pdf' w katalogu aplikacji. Ścieżka poszukiwań: {templatePath}");
+                    // Fallback do standardowego szablonu template.pdf
+                    string defaultTemplatePath = Path.Combine(AppContext.BaseDirectory, "template.pdf");
+                    if (!File.Exists(defaultTemplatePath))
+                    {
+                        defaultTemplatePath = Path.Combine(Directory.GetCurrentDirectory(), "template.pdf");
+                    }
+
+                    if (File.Exists(defaultTemplatePath))
+                    {
+                        _logger.LogWarning("Nie odnaleziono dedykowanego szablonu '{TemplateName}'. Użycie szablonu domyślnego: {DefaultTemplate}", templateName, defaultTemplatePath);
+                        templatePath = defaultTemplatePath;
+                    }
+                    else
+                    {
+                        throw new FileNotFoundException($"Brak szablonu '{templateName}' oraz domyślnego 'template.pdf' w aplikacji.");
+                    }
                 }
             }
 
-            _logger.LogInformation("Używanie szablonu PDF ze ścieżki: {TemplatePath}", templatePath);
-
-            // 2. Pobranie zamakietowanych danych pracownika
-            ContractData employeeData = GetMockContractData(employeeId);
-            _logger.LogInformation("Pobrano zamakietowane dane pracownika: {Imie} {Nazwisko}", employeeData.Imie, employeeData.Nazwisko);
-
-            // 3. Otwarcie i modyfikacja szablonu PDF za pomocą PdfSharpCore
-            byte[] pdfBytes;
             using (var document = PdfReader.Open(templatePath, PdfDocumentOpenMode.Modify))
             {
                 PdfAcroForm acroForm = document.AcroForm;
                 if (acroForm == null)
                 {
-                    _logger.LogError("Wybrany plik PDF nie posiada interaktywnych pól formularza (AcroForms)!");
-                    throw new InvalidOperationException("Plik szablonu PDF nie posiada interaktywnych pól formularza (AcroForms).");
+                    throw new InvalidOperationException($"Plik szablonu {templatePath} nie zawiera pól formularza (AcroForms).");
                 }
 
-                // Log all available form field names for debugging
-                foreach (var fieldName in acroForm.Fields.Names)
-                {
-                    _logger.LogInformation("PDF field available: {FieldName}", fieldName);
-                }
-
-                // Ensure NeedAppearances is set so values are rendered
+                // Odświeżanie wyglądu pól formularza w przeglądarkach PDF
                 if (acroForm.Elements.ContainsKey("/NeedAppearances"))
                 {
                     acroForm.Elements["/NeedAppearances"] = new PdfBoolean(true);
@@ -75,113 +141,25 @@ namespace GenerateDocumentLibrary.Services
                     acroForm.Elements.Add("/NeedAppearances", new PdfBoolean(true));
                 }
 
-                // Fill primary fields mapping to the actual template field names: Text1, Text2, Text3
-                SetFormField(acroForm, "Text1", employeeData.Imie);
-                SetFormField(acroForm, "Text2", employeeData.Nazwisko);
-                SetFormField(acroForm, "Text3", employeeData.NumerPaszportu);
+                // Wypełnienie pól za pomocą dedykowanej strategii
+                filler.FillForm(acroForm, employeeData, _logger);
 
-
-
-                // Zapis dokumentu do MemoryStream
                 using (var outputStream = new MemoryStream())
                 {
                     document.Save(outputStream, false);
-                    pdfBytes = outputStream.ToArray();
+                    return outputStream.ToArray();
                 }
             }
+        }
 
-            _logger.LogInformation("Dokument PDF został pomyślnie wygenerowany w bibliotece. Rozmiar: {Size} bajtów.", pdfBytes.Length);
+        /// <summary>
+        /// Zapisywanie pliku do bazy danych wraz z typem dokumentu.
+        /// </summary>
+        public async Task SaveFileToDatabaseAsync(string employeeId, DocumentType documentType, byte[] fileData)
+        {
+            _logger.LogInformation("[DB_SAVE] Zapisywanie pliku typu: {DocType} (Rozmiar: {Size} bajtów) dla EmployeeId: {EmployeeId}", documentType, fileData.Length, employeeId);
             
-            // Asynchroniczne wywołanie zapisu (symulowane)
-            await SaveFileToDatabaseAsync(employeeId, pdfBytes);
-
-            return pdfBytes;
-        }
-
-        /// <summary>
-        /// Pomocnicza metoda bezpiecznie wstrzykująca dane do pola formularza PDF.
-        /// </summary>
-        private void SetFormField(PdfAcroForm acroForm, string fieldName, string value)
-        {
-            try
-            {
-                // Find field case‑insensitively
-                var matchingKey = acroForm.Fields.Names
-                    .FirstOrDefault(k => string.Equals(k, fieldName, StringComparison.OrdinalIgnoreCase));
-
-                if (matchingKey != null)
-                {
-                    var field = acroForm.Fields[matchingKey];
-                    if (field is PdfTextField textField)
-                    {
-                        // Use Unicode encoding for Polish characters
-                        textField.Value = new PdfString(value ?? string.Empty, PdfStringEncoding.Unicode);
-                        textField.ReadOnly = true;
-
-                        // Remove border by setting BS width to 0
-                        var bs = textField.Elements.GetDictionary("/BS");
-                        if (bs == null)
-                        {
-                            bs = new PdfDictionary();
-                            textField.Elements["/BS"] = bs;
-                        }
-                        bs.Elements["/W"] = new PdfInteger(0);
-
-                        // Remove background and border colors from MK characteristics
-                        var mk = textField.Elements.GetDictionary("/MK");
-                        if (mk == null)
-                        {
-                            mk = new PdfDictionary();
-                            textField.Elements["/MK"] = mk;
-                        }
-                        mk.Elements.Remove("/BG");
-                        mk.Elements.Remove("/BC");
-
-                        _logger.LogInformation("Biblioteka -> Zapisano pole: '{FieldName}' = '{Value}'", matchingKey, value);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Pole '{FieldName}' istnieje, ale nie jest typu tekstowego. Typ: {Type}", matchingKey, field.GetType().Name);
-                    }
-                }
-                else
-                {
-                    _logger.LogDebug("Pole '{FieldName}' nie występuje w bieżącym szablonie PDF (pomijanie).", fieldName);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Błąd podczas próby zapisu pola '{FieldName}'", fieldName);
-            }
-        }
-
-        /// <summary>
-        /// Zwraca zamakietowane dane pracownika na podstawie identyfikatora.
-        /// </summary>
-        public ContractData GetMockContractData(string employeeId)
-        {
-            return new ContractData
-            {
-                Imie = "Jon",
-                Nazwisko = "Kamil",
-                NumerPaszportu = "777",
-                ElementyTabeli = new List<TableItem>
-                {
-                    new TableItem { Opis = "Usługi konsultingowe IT - Maj 2026", Kwota = "12 500,00 PLN" },
-                    new TableItem { Opis = "Wsparcie wdrożeniowe Azure Cloud", Kwota = "4 200,00 PLN" },
-                    new TableItem { Opis = "Refaktoryzacja kodu do .NET 8 Isolated", Kwota = "3 800,00 PLN" }
-                }
-            };
-        }
-
-        /// <summary>
-        /// Pusta asynchroniczna metoda przygotowana pod przyszłą integrację zapisu do bazy danych.
-        /// </summary>
-        public async Task SaveFileToDatabaseAsync(string employeeId, byte[] fileData)
-        {
-            _logger.LogInformation("[DB_SAVE] Zapisywanie pliku do bazy z poziomu biblioteki dla EmployeeId: {EmployeeId}", employeeId);
-            
-            // Miejsce na Twoją przyszłą logikę biznesową zapisu (np. Azure SQL, Blob Storage, Dataverse)
+            // Miejsce na integrację z Azure SQL, CosmosDB, Blob Storage itp.
             
             await Task.CompletedTask;
         }
